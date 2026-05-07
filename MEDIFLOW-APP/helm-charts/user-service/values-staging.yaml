@@ -1,0 +1,13 @@
+replicaCount: 2
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "250m"
+  limits:
+    memory: "512Mi"
+    cpu: "500m"
+env:
+  NODE_ENV: staging
+  LOG_LEVEL: info
+autoscaling:
+  enabled: false

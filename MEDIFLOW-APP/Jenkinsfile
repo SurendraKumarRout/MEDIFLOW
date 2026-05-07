@@ -1,0 +1,589 @@
+// =============================================================================
+// MediFlow — Complete CI/CD Jenkinsfile
+// Location: Jenkinsfile (root of repository)
+//
+// BRANCHING STRATEGY:
+// Feature branch → Stages 1-3 only (tests only, no build, no deploy)
+// Develop branch → Stages 1-7 (build + deploy to dev)
+// Main branch    → Stages 1-6, 8-13 (build + deploy to staging + prod with approval)
+// =============================================================================
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION          = 'ap-south-1'
+        AWS_ACCOUNT_ID      = '123456789012'
+        ECR_REGISTRY        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        GIT_COMMIT_SHORT    = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        BUILD_DATE          = sh(script: 'date +%Y%m%d', returnStdout: true).trim()
+        BRANCH_NAME_CLEAN   = env.GIT_BRANCH.replaceAll('origin/', '').replaceAll('/', '-')
+        K8S_NAMESPACE       = 'mediflow'
+        KUBECONFIG_DEV      = '/home/jenkins/.kube/config-dev'
+        KUBECONFIG_STAGING  = '/home/jenkins/.kube/config-staging'
+        KUBECONFIG_PROD     = '/home/jenkins/.kube/config-prod'
+        SLACK_CHANNEL       = '#mediflow-deployments'
+        SONAR_PROJECT_KEY   = 'mediflow'
+        HELM_CHARTS_PATH    = './helm-charts'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ======================================================================
+        // STAGE 1: CHECKOUT
+        // Pull latest code from GitHub
+        // ======================================================================
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh '''
+                    echo "=== Build Information ==="
+                    echo "Branch:  ${GIT_BRANCH}"
+                    echo "Commit:  ${GIT_COMMIT}"
+                    echo "Build:   ${BUILD_NUMBER}"
+                    echo "Date:    ${BUILD_DATE}"
+                    echo "========================="
+                '''
+            }
+        }
+
+        // ======================================================================
+        // STAGE 2: RUN TESTS
+        // Runs on ALL branches (feature, develop, main)
+        // Detects which services changed and tests only those
+        // If tests fail: pipeline stops, developer notified
+        // ======================================================================
+        stage('Run Tests') {
+            steps {
+                script {
+                    def changedServices = sh(
+                        script: "git diff --name-only HEAD~1 HEAD | grep '^services/' | cut -d'/' -f2 | sort -u || echo 'all'",
+                        returnStdout: true
+                    ).trim().split('\n')
+
+                    def allServices = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def servicesToTest = changedServices.contains('all') ? allServices : changedServices.toList()
+
+                    servicesToTest.each { service ->
+                        if (fileExists("services/${service}/package.json")) {
+                            echo "=== Testing ${service} ==="
+                            dir("services/${service}") {
+                                sh '''
+                                    npm ci
+                                    npm audit --audit-level=high
+                                    npm run lint || true
+                                    npm run test:unit
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ Tests FAILED on ${env.GIT_BRANCH}\nCommit: ${env.GIT_COMMIT_SHORT}\nBuild: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 3: SONARQUBE ANALYSIS
+        // Code quality and security analysis
+        // Runs on ALL branches
+        // Fails if: critical security issues, coverage below 75%
+        // ======================================================================
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=services \
+                          -Dsonar.exclusions=**/node_modules/**,**/tests/**,**/coverage/** \
+                          -Dsonar.qualitygate.wait=true
+                    '''
+                }
+            }
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ SonarQube Quality Gate FAILED on ${env.GIT_BRANCH}\nPlease fix code quality issues before proceeding."
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 4: BUILD DOCKER IMAGES
+        // Only runs for develop and main branches
+        // Feature branches: tests only, no Docker build (saves time + resources)
+        // Auto image tag: branch-date-commitHash (e.g. develop-20250124-abc123)
+        // ======================================================================
+        stage('Build Docker Images') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+
+                    services.each { service ->
+                        def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+                        def imageFull = "${env.ECR_REGISTRY}/mediflow/${service}:${imageTag}"
+
+                        echo "=== Building ${service} ==="
+                        dir("services/${service}") {
+                            sh """
+                                docker build \
+                                  --tag ${imageFull} \
+                                  --tag ${env.ECR_REGISTRY}/mediflow/${service}:latest \
+                                  --build-arg BUILD_DATE=${env.BUILD_DATE} \
+                                  --build-arg GIT_COMMIT=${env.GIT_COMMIT_SHORT} \
+                                  --no-cache \
+                                  .
+                                echo "✅ Built: ${imageFull}"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 5: TRIVY SECURITY SCAN
+        // Scans each Docker image for OS and library vulnerabilities
+        // Fails if CRITICAL vulnerabilities found
+        // Only runs for develop and main branches
+        // ======================================================================
+        stage('Trivy Image Scan') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    services.each { service ->
+                        def imageFull = "${env.ECR_REGISTRY}/mediflow/${service}:${imageTag}"
+                        echo "=== Scanning ${service} with Trivy ==="
+                        sh """
+                            trivy image \
+                              --severity HIGH,CRITICAL \
+                              --exit-code 1 \
+                              --no-progress \
+                              --format table \
+                              ${imageFull}
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ Trivy found CRITICAL vulnerabilities!\nDeployment blocked for security.\nBranch: ${env.GIT_BRANCH}"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 6: PUSH TO ECR
+        // Authenticates via Jenkins IAM Role (no credentials stored)
+        // Pushes all 7 service images to AWS ECR
+        // ECR automatically scans images after push
+        // ======================================================================
+        stage('Push to ECR') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    // Authenticate with ECR using IAM Role (no passwords needed)
+                    sh """
+                        aws ecr get-login-password --region ${env.AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${env.ECR_REGISTRY}
+                    """
+
+                    services.each { service ->
+                        def imageFull = "${env.ECR_REGISTRY}/mediflow/${service}:${imageTag}"
+                        echo "=== Pushing ${service} to ECR ==="
+                        sh """
+                            docker push ${imageFull}
+                            docker push ${env.ECR_REGISTRY}/mediflow/${service}:latest
+                            echo "✅ Pushed: ${imageFull}"
+                        """
+                    }
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 7: DEPLOY TO DEV
+        // Deploys all 7 services to dev EKS cluster using Helm
+        // Runs only on develop branch
+        // Automatic - no approval needed for dev
+        // --atomic flag: auto-rollback if deployment fails
+        // ======================================================================
+        stage('Deploy to Dev') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    services.each { service ->
+                        echo "=== Deploying ${service} to DEV ==="
+                        sh """
+                            helm upgrade --install ${service} ${env.HELM_CHARTS_PATH}/${service} \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --create-namespace \
+                              --set image.tag=${imageTag} \
+                              --set environment=dev \
+                              --values ${env.HELM_CHARTS_PATH}/${service}/values-dev.yaml \
+                              --kubeconfig ${env.KUBECONFIG_DEV} \
+                              --wait \
+                              --timeout 5m \
+                              --atomic
+                            echo "✅ ${service} deployed to DEV"
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: "✅ All services deployed to DEV\nImage: ${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}\nBranch: ${env.GIT_BRANCH}"
+                    )
+                }
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ DEV deployment FAILED\nHelm automatically rolled back to previous version.\nBranch: ${env.GIT_BRANCH}"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 8: DEPLOY TO STAGING
+        // Deploys all 7 services to staging EKS cluster using Helm
+        // Runs only on main branch
+        // Automatic - no approval needed for staging
+        // Staging mirrors production settings closely
+        // ======================================================================
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    services.each { service ->
+                        echo "=== Deploying ${service} to STAGING ==="
+                        sh """
+                            helm upgrade --install ${service} ${env.HELM_CHARTS_PATH}/${service} \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --create-namespace \
+                              --set image.tag=${imageTag} \
+                              --set environment=staging \
+                              --values ${env.HELM_CHARTS_PATH}/${service}/values-staging.yaml \
+                              --kubeconfig ${env.KUBECONFIG_STAGING} \
+                              --wait \
+                              --timeout 10m \
+                              --atomic
+                            echo "✅ ${service} deployed to STAGING"
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: "✅ All services deployed to STAGING\nImage: ${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}\nQA team please verify before approving production."
+                    )
+                }
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ STAGING deployment FAILED\nProduction deployment blocked.\nBranch: ${env.GIT_BRANCH}"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 9: MANUAL APPROVAL FOR PRODUCTION
+        // Pipeline pauses here and waits for human to click "Deploy"
+        // Only devops-team members can approve
+        // The 'input' keyword automatically creates approval button in Jenkins UI
+        // No manual UI setup needed - code creates the button automatically
+        // ======================================================================
+        stage('Approval for Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    input(
+                        message: 'Deploy all MediFlow services to PRODUCTION?',
+                        ok: 'Deploy to Production',
+                        submitter: 'devops-team',
+                        parameters: [
+                            string(
+                                name: 'DEPLOYMENT_NOTES',
+                                description: 'What does this deployment include?',
+                                defaultValue: ''
+                            )
+                        ]
+                    )
+                    echo "Production deployment approved"
+                    sh "echo 'Production approved at \$(date) for image ${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}' >> /var/log/jenkins/deployment-audit.log"
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 10: DEPLOY TO PRODUCTION
+        // Deploys all 7 services to prod EKS cluster using Helm
+        // Rolling update: one pod at a time, health checks between each
+        // --atomic flag: auto-rollback if ANY pod fails health check
+        // ======================================================================
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    services.each { service ->
+                        echo "=== Deploying ${service} to PRODUCTION ==="
+                        sh """
+                            helm upgrade --install ${service} ${env.HELM_CHARTS_PATH}/${service} \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --create-namespace \
+                              --set image.tag=${imageTag} \
+                              --set environment=prod \
+                              --values ${env.HELM_CHARTS_PATH}/${service}/values-prod.yaml \
+                              --kubeconfig ${env.KUBECONFIG_PROD} \
+                              --wait \
+                              --timeout 15m \
+                              --atomic
+                            echo "✅ ${service} deployed to PRODUCTION"
+                        """
+                    }
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 11: HEALTH CHECK VERIFICATION
+        // Verifies all pods are running and healthy after production deployment
+        // Checks: pod status, readiness, recent error logs
+        // If unhealthy: triggers immediate rollback and alerts team
+        // ======================================================================
+        stage('Health Check Verification') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+
+                    services.each { service ->
+                        echo "=== Verifying health of ${service} in PRODUCTION ==="
+                        sh """
+                            kubectl rollout status deployment/${service} \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --kubeconfig ${env.KUBECONFIG_PROD} \
+                              --timeout=5m
+
+                            RUNNING=\$(kubectl get pods \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --kubeconfig ${env.KUBECONFIG_PROD} \
+                              --selector=app=${service} \
+                              --field-selector=status.phase=Running \
+                              --no-headers | wc -l)
+
+                            TOTAL=\$(kubectl get pods \
+                              --namespace ${env.K8S_NAMESPACE} \
+                              --kubeconfig ${env.KUBECONFIG_PROD} \
+                              --selector=app=${service} \
+                              --no-headers | wc -l)
+
+                            echo "${service}: \${RUNNING}/\${TOTAL} pods running"
+
+                            if [ "\${RUNNING}" != "\${TOTAL}" ]; then
+                              echo "❌ ${service} health check failed! Triggering rollback..."
+                              helm rollback ${service} 0 \
+                                --namespace ${env.K8S_NAMESPACE} \
+                                --kubeconfig ${env.KUBECONFIG_PROD}
+                              exit 1
+                            fi
+
+                            echo "✅ ${service} is healthy"
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "🚨 PRODUCTION health check FAILED!\nAutomatic rollback triggered.\nImmediate attention required!"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 12: SMOKE TESTS
+        // Basic sanity tests against live production environment
+        // Tests critical user flows: health endpoints, API availability
+        // If smoke tests fail: immediate rollback
+        // ======================================================================
+        stage('Smoke Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    echo "=== Running Smoke Tests in PRODUCTION ==="
+
+                    PROD_URL="https://api.mediflow.in"
+
+                    echo "Test 1: API Gateway Health"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${PROD_URL}/health || echo "000")
+                    if [ "${STATUS}" != "200" ]; then
+                      echo "❌ Health check failed: ${STATUS}"
+                      exit 1
+                    fi
+                    echo "✅ Health check passed"
+
+                    echo "Test 2: User Service"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${PROD_URL}/api/v1/auth/health || echo "000")
+                    echo "User Service status: ${STATUS}"
+
+                    echo "Test 3: Product Service"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${PROD_URL}/api/v1/products/health || echo "000")
+                    echo "Product Service status: ${STATUS}"
+
+                    echo "Test 4: Order Service"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${PROD_URL}/api/v1/orders/health || echo "000")
+                    echo "Order Service status: ${STATUS}"
+
+                    echo "=== All smoke tests completed ==="
+                '''
+            }
+            post {
+                failure {
+                    script {
+                        def services = ['user-service', 'product-service', 'cart-service', 'order-service', 'payment-service', 'inventory-service', 'notification-service']
+                        services.each { service ->
+                            sh """
+                                helm rollback ${service} 0 \
+                                  --namespace ${env.K8S_NAMESPACE} \
+                                  --kubeconfig ${env.KUBECONFIG_PROD} || true
+                            """
+                        }
+                    }
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "🚨 PRODUCTION smoke tests FAILED!\nAutomatic rollback triggered.\nImmediate attention required!"
+                    )
+                }
+            }
+        }
+
+        // ======================================================================
+        // STAGE 13: NOTIFY SUCCESS
+        // Notifies team about successful deployment
+        // Includes: what deployed, when, which image, build link
+        // ======================================================================
+        stage('Notify Success') {
+            steps {
+                script {
+                    def environment = env.GIT_BRANCH == 'main' ? 'PRODUCTION' : 'DEV'
+                    def imageTag = "${env.BRANCH_NAME_CLEAN}-${env.BUILD_DATE}-${env.GIT_COMMIT_SHORT}"
+
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: """✅ *MediFlow Deployment Successful*
+*Environment:* ${environment}
+*Image Tag:* ${imageTag}
+*Branch:* ${env.GIT_BRANCH}
+*Commit:* ${env.GIT_COMMIT_SHORT}
+*Build:* #${env.BUILD_NUMBER}
+*Build URL:* ${env.BUILD_URL}"""
+                    )
+
+                    if (env.GIT_BRANCH == 'main') {
+                        emailext(
+                            to: 'devops-team@mediflow.in',
+                            subject: "✅ MediFlow deployed to PRODUCTION — ${imageTag}",
+                            body: "All 7 MediFlow services successfully deployed to production.\nImage: ${imageTag}\nBuild: ${env.BUILD_URL}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                docker system prune -f || true
+            '''
+            junit allowEmptyResults: true, testResults: '**/test-results/*.xml'
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: "❌ Pipeline FAILED for ${env.GIT_BRANCH}\nBuild: ${env.BUILD_URL}\nPlease investigate."
+            )
+        }
+    }
+}

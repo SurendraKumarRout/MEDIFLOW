@@ -1,0 +1,35 @@
+{
+  "name": "mediflow-cart-service",
+  "version": "1.0.0",
+  "description": "MediFlow Cart Service - Shopping cart management via Redis",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit --coverage",
+    "test:integration": "jest tests/integration --coverage",
+    "lint": "eslint src/**/*.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "redis": "^4.6.7",
+    "axios": "^1.4.0",
+    "winston": "^3.10.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "jest": "^29.6.2",
+    "supertest": "^6.3.3",
+    "nodemon": "^3.0.1",
+    "eslint": "^8.47.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": ["src/**/*.js"]
+  }
+}

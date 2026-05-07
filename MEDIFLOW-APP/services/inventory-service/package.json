@@ -1,0 +1,37 @@
+{
+  "name": "mediflow-inventory-service",
+  "version": "1.0.0",
+  "description": "MediFlow Inventory Service - Stock tracking and management",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit --coverage",
+    "test:integration": "jest tests/integration --coverage",
+    "lint": "eslint src/**/*.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "sequelize": "^6.32.1",
+    "pg": "^8.11.3",
+    "pg-hstore": "^2.3.4",
+    "amqplib": "^0.10.3",
+    "winston": "^3.10.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "jest": "^29.6.2",
+    "supertest": "^6.3.3",
+    "nodemon": "^3.0.1",
+    "eslint": "^8.47.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": ["src/**/*.js"]
+  }
+}

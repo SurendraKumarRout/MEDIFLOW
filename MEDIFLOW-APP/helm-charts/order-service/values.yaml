@@ -1,0 +1,52 @@
+image:
+  repository: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/mediflow/order-service
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 3005
+
+replicaCount: 1
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3005
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 3005
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+env:
+  NODE_ENV: production
+  PORT: "3005"
+  LOG_LEVEL: info
+  SERVICE_NAME: order-service
